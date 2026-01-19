@@ -87,14 +87,23 @@ class MarketAnalyzer:
     5. 生成大盘复盘报告
     """
     
-    # 主要指数代码
-    MAIN_INDICES = {
+    # 主要指数代码 (A股)
+    CN_INDICES = {
         'sh000001': '上证指数',
         'sz399001': '深证成指',
         'sz399006': '创业板指',
         'sh000688': '科创50',
         'sh000016': '上证50',
         'sh000300': '沪深300',
+    }
+    
+    # 主要指数代码 (美股)
+    US_INDICES = {
+        '^DJI': '道琼斯',
+        '^IXIC': '纳斯达克',
+        '^GSPC': '标普500',
+        '^RUT': '罗素2000',
+        '^VIX': '恐慌指数',
     }
     
     def __init__(self, search_service: Optional[SearchService] = None, analyzer=None):
@@ -109,6 +118,18 @@ class MarketAnalyzer:
         self.search_service = search_service
         self.analyzer = analyzer
         
+    def _is_us_market(self) -> bool:
+        """判断是否为美股市场模式"""
+        # 检查配置中的自选股列表
+        if not self.config.stock_list:
+            return False
+            
+        # 取第一个非空代码检查
+        first_code = self.config.stock_list[0]
+        # 美股代码通常是纯字母（如 AAPL）
+        # A股代码通常是数字（如 600519）
+        return first_code.replace('.', '').isalpha()
+        
     def get_market_overview(self) -> MarketOverview:
         """
         获取市场概览数据
@@ -119,17 +140,33 @@ class MarketAnalyzer:
         today = datetime.now().strftime('%Y-%m-%d')
         overview = MarketOverview(date=today)
         
-        # 1. 获取主要指数行情
-        overview.indices = self._get_main_indices()
+        is_us = self._is_us_market()
         
-        # 2. 获取涨跌统计
-        self._get_market_statistics(overview)
-        
-        # 3. 获取板块涨跌榜
-        self._get_sector_rankings(overview)
-        
-        # 4. 获取北向资金（可选）
-        # self._get_north_flow(overview)
+        if is_us:
+            # === 美股复盘流程 ===
+            logger.info("[大盘] 检测到美股模式，执行美股市场分析...")
+            
+            # 1. 获取美股指数
+            overview.indices = self._get_us_indices()
+            
+            # 2. 涨跌统计 (可选，需全市场数据)
+            # 目前仅通过指数反映
+            
+            # 3. 板块涨跌 (yfinance 获取板块ETF数据)
+            self._get_us_sector_rankings(overview)
+            
+        else:
+            # === A股复盘流程 ===
+            logger.info("[大盘] 执行A股市场分析...")
+            
+            # 1. 获取主要指数行情
+            overview.indices = self._get_main_indices()
+            
+            # 2. 获取涨跌统计
+            self._get_market_statistics(overview)
+            
+            # 3. 获取板块涨跌榜
+            self._get_sector_rankings(overview)
         
         return overview
 
@@ -145,9 +182,97 @@ class MarketAnalyzer:
                     time.sleep(min(2 ** attempt, 5))
         logger.error(f"[大盘] {name} 最终失败: {last_error}")
         return None
-    
+        
+    def _get_us_indices(self) -> List[MarketIndex]:
+        """获取美股主要指数"""
+        indices = []
+        try:
+            logger.info("[大盘] 获取美股指数实时行情...")
+            import yfinance as yf
+            
+            # 批量获取
+            tickers = list(self.US_INDICES.keys())
+            # yfinance 批量下载
+            # period='1d' 获取最新数据
+            df = yf.download(tickers, period='1d', progress=False)
+            
+            # yfinance >= 0.2.0 返回多级索引 (Price, Ticker)
+            # 需要处理
+            
+            for code, name in self.US_INDICES.items():
+                try:
+                    # 获取对应 ticker 的数据
+                    # df['Close'][code]
+                    if len(df) > 0:
+                        # 提取最新一行
+                        close = float(df['Close'][code].iloc[-1])
+                        # 涨跌幅需要前一日收盘，或者计算
+                        # yfinance batch download 可能不直接包含 change_pct via simple access
+                        # 简单起见，单独获取 Ticker 对象可能更准确
+                        ticker = yf.Ticker(code)
+                        info = ticker.info # info 可能比较慢，或者用 fast_info
+                        fast_info = ticker.fast_info
+                        
+                        current = fast_info.last_price
+                        prev_close = fast_info.previous_close
+                        change = current - prev_close
+                        change_pct = (change / prev_close) * 100
+                        
+                        index = MarketIndex(
+                            code=code,
+                            name=name,
+                            current=current,
+                            change=change,
+                            change_pct=change_pct,
+                            prev_close=prev_close,
+                            # 其它字段可选
+                        )
+                        indices.append(index)
+                except Exception as e:
+                    logger.warning(f"获取指数 {name} 失败: {e}")
+                    
+            logger.info(f"[大盘] 获取到 {len(indices)} 个美股指数")
+            
+        except Exception as e:
+            logger.error(f"[大盘] 获取美股指数失败: {e}")
+            
+        return indices
+        
+    def _get_us_sector_rankings(self, overview: MarketOverview):
+        """获取美股板块表现 (通过 Sector ETF)"""
+        try:
+            # 标普500 11大板块 ETF
+            sectors = {
+                'XLK': '科技', 'XLV': '医疗', 'XLF': '金融', 
+                'XLC': '通讯', 'XLY': '可选消费', 'XLP': '必选消费',
+                'XLE': '能源', 'XLI': '工业', 'XLB': '材料',
+                'XLU': '公用事业', 'XLRE': '房地产'
+            }
+            
+            import yfinance as yf
+            data = []
+            
+            for code, name in sectors.items():
+                try:
+                    ticker = yf.Ticker(code)
+                    fast_info = ticker.fast_info
+                    change_pct = ((fast_info.last_price - fast_info.previous_close) 
+                                / fast_info.previous_close * 100)
+                    data.append({'name': name, 'change_pct': change_pct})
+                except:
+                    continue
+                    
+            if data:
+                # 排序
+                data.sort(key=lambda x: x['change_pct'], reverse=True)
+                overview.top_sectors = data[:3]
+                overview.bottom_sectors = data[-3:][::-1]
+                
+        except Exception as e:
+            logger.warning(f"获取美股板块失败: {e}")
+
     def _get_main_indices(self) -> List[MarketIndex]:
-        """获取主要指数实时行情"""
+        """获取A股主要指数实时行情"""
         indices = []
         
         try:
@@ -157,7 +282,7 @@ class MarketAnalyzer:
             df = self._call_akshare_with_retry(ak.stock_zh_index_spot_sina, "指数行情", attempts=2)
             
             if df is not None and not df.empty:
-                for code, name in self.MAIN_INDICES.items():
+                for code, name in self.CN_INDICES.items():
                     # 查找对应指数
                     row = df[df['代码'] == code]
                     if row.empty:
@@ -296,11 +421,20 @@ class MarketAnalyzer:
         month_str = f"{today.year}年{today.month}月"
         
         # 多维度搜索
-        search_queries = [
-            f"A股 大盘 复盘 {month_str}",
-            f"股市 行情 分析 今日 {month_str}",
-            f"A股 市场 热点 板块 {month_str}",
-        ]
+        if self._is_us_market():
+             search_queries = [
+                f"US Stock Market Analysis {month_str}",
+                f"Nasdaq SP500 Dow Jones today {month_str}",
+                f"US Market Top Gainers Sectors {month_str}",
+             ]
+             stock_name_kw = "US Market"
+        else:
+            search_queries = [
+                f"A股 大盘 复盘 {month_str}",
+                f"股市 行情 分析 今日 {month_str}",
+                f"A股 市场 热点 板块 {month_str}",
+            ]
+            stock_name_kw = "大盘"
         
         try:
             logger.info("[大盘] 开始搜索市场新闻...")

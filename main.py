@@ -44,7 +44,9 @@ from feishu_doc import FeishuDocManager
 from config import get_config, Config
 from storage import get_db, DatabaseManager
 from data_provider import DataFetcherManager
-from data_provider.akshare_fetcher import AkshareFetcher, RealtimeQuote, ChipDistribution
+from data_provider.base import RealtimeQuote, ChipDistribution
+from data_provider.akshare_fetcher import AkshareFetcher
+from data_provider.yfinance_fetcher import YfinanceFetcher
 from analyzer import GeminiAnalyzer, AnalysisResult, STOCK_NAME_MAP
 from notification import NotificationService, NotificationChannel, send_daily_report
 from search_service import SearchService, SearchResponse
@@ -150,6 +152,7 @@ class StockAnalysisPipeline:
         self.db = get_db()
         self.fetcher_manager = DataFetcherManager()
         self.akshare_fetcher = AkshareFetcher()  # 用于获取增强数据（量比、筹码等）
+        self.yfinance_fetcher = YfinanceFetcher()  # 用于美股实时行情
         self.trend_analyzer = StockTrendAnalyzer()  # 趋势分析器
         self.analyzer = GeminiAnalyzer()
         self.notifier = NotificationService()
@@ -238,8 +241,17 @@ class StockAnalysisPipeline:
             
             # Step 1: 获取实时行情（量比、换手率等）
             realtime_quote: Optional[RealtimeQuote] = None
+            
+            # 判断是否为美股 (简单判断：纯字母且通常较短)
+            is_us_stock = (len(code) <= 5 and code.replace('.', '').isalpha() and not code.endswith(('.SS', '.SZ', '.SH')))
+            
             try:
-                realtime_quote = self.akshare_fetcher.get_realtime_quote(code)
+                if is_us_stock:
+                    logger.info(f"[{code}] 使用 Yfinance 获取实时行情")
+                    realtime_quote = self.yfinance_fetcher.get_realtime_quote(code)
+                else:
+                    realtime_quote = self.akshare_fetcher.get_realtime_quote(code)
+                
                 if realtime_quote:
                     # 使用实时行情返回的真实股票名称
                     if realtime_quote.name:
@@ -253,15 +265,18 @@ class StockAnalysisPipeline:
             if not stock_name:
                 stock_name = f'股票{code}'
             
-            # Step 2: 获取筹码分布
+            # Step 2: 获取筹码分布 (仅A股)
             chip_data: Optional[ChipDistribution] = None
-            try:
-                chip_data = self.akshare_fetcher.get_chip_distribution(code)
-                if chip_data:
-                    logger.info(f"[{code}] 筹码分布: 获利比例={chip_data.profit_ratio:.1%}, "
-                              f"90%集中度={chip_data.concentration_90:.2%}")
-            except Exception as e:
-                logger.warning(f"[{code}] 获取筹码分布失败: {e}")
+            if not is_us_stock:
+                try:
+                    chip_data = self.akshare_fetcher.get_chip_distribution(code)
+                    if chip_data:
+                        logger.info(f"[{code}] 筹码分布: 获利比例={chip_data.profit_ratio:.1%}, "
+                                  f"90%集中度={chip_data.concentration_90:.2%}")
+                except Exception as e:
+                    logger.warning(f"[{code}] 获取筹码分布失败: {e}")
+            else:
+                logger.debug(f"[{code}] 美股跳过筹码分布分析")
             
             # Step 3: 趋势分析（基于交易理念）
             trend_result: Optional[TrendAnalysisResult] = None

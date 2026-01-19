@@ -27,31 +27,25 @@ from tenacity import (
     before_sleep_log,
 )
 
-from .base import BaseFetcher, DataFetchError, STANDARD_COLUMNS
+from .base import BaseFetcher, DataFetchError, RateLimitError, STANDARD_COLUMNS, RealtimeQuote
 
 logger = logging.getLogger(__name__)
 
 
 class YfinanceFetcher(BaseFetcher):
     """
-    Yahoo Finance 数据源实现
+    Yfinance 数据源 (Priority 4)
     
-    优先级：4（最低，作为兜底）
-    数据来源：Yahoo Finance
+    特点：
+    - 支持全球股市（美股、港股、A股）
+    - 数据质量较高
+    - 访问速度较慢（需网络支持）
     
-    关键策略：
-    - 自动转换股票代码格式
-    - 处理时区和数据格式差异
-    - 失败后指数退避重试
-    
-    注意事项：
-    - A 股数据可能有延迟
-    - 某些股票可能无数据
-    - 数据精度可能与国内源略有差异
+    作为兜底数据源，主要用于获取其他源不支持的股票数据
     """
     
-    name = "YfinanceFetcher"
-    priority = 4
+    name: str = "YfinanceFetcher"
+    priority: int = 4
     
     def __init__(self):
         """初始化 YfinanceFetcher"""
@@ -64,14 +58,25 @@ class YfinanceFetcher(BaseFetcher):
         Yahoo Finance A 股代码格式：
         - 沪市：600519.SS (Shanghai Stock Exchange)
         - 深市：000001.SZ (Shenzhen Stock Exchange)
+        - 美股：AAPL, MSFT (直接使用代码)
         
         Args:
-            stock_code: 原始代码，如 '600519', '000001'
+            stock_code: 原始代码，如 '600519', '000001', 'AAPL'
             
         Returns:
-            Yahoo Finance 格式代码，如 '600519.SS', '000001.SZ'
+            Yahoo Finance 格式代码
         """
         code = stock_code.strip()
+        
+        # 美股代码（纯字母）直接返回
+        # 排除包含 .SS .SZ 的情况 (虽然 alpha check 也会排除点号)
+        # 注意：有些美股代码包含点号，如 BRK.B
+        is_us_stock = (
+            code.replace('.', '').isalpha() and 
+            not code.endswith(('.SS', '.SZ', '.SH'))
+        )
+        if is_us_stock:
+            return code.upper()
         
         # 已经包含后缀的情况
         if '.SS' in code.upper() or '.SZ' in code.upper():
@@ -86,8 +91,83 @@ class YfinanceFetcher(BaseFetcher):
         elif code.startswith(('000', '002', '300')):
             return f"{code}.SZ"
         else:
+            # 如果是纯字母但没匹配上前面的逻辑，可能是生僻美股或其它，尝试直接用
+            if code.replace('.', '').isalpha():
+                return code.upper()
+                
             logger.warning(f"无法确定股票 {code} 的市场，默认使用深市")
             return f"{code}.SZ"
+            
+    def get_realtime_quote(self, stock_code: str) -> Optional[RealtimeQuote]:
+        """获取实时行情"""
+        try:
+             import yfinance as yf
+             # Convert logic for symbol
+             symbol = self._convert_stock_code(stock_code)
+             ticker = yf.Ticker(symbol)
+             
+             # fast_info is preferred for price
+             fast_info = ticker.fast_info
+             price = float(fast_info.last_price) if fast_info.last_price else 0.0
+             prev_close = float(fast_info.previous_close) if fast_info.previous_close else 0.0
+             
+             if price and prev_close:
+                 change_amount = price - prev_close
+                 change_pct = (change_amount / prev_close) * 100
+             else:
+                 change_amount = 0.0
+                 change_pct = 0.0
+             
+             # basic info
+             name = stock_code
+             pe = 0.0
+             pb = 0.0
+             total_mv = 0.0
+             high_52w = 0.0
+             low_52w = 0.0
+             
+             try:
+                 # info request might be slow
+                 try:
+                     info = ticker.info
+                 except:
+                     info = {}
+                     
+                 name = info.get('shortName') or info.get('longName') or stock_code
+                 pe = info.get('trailingPE', 0.0) or 0.0
+                 pb = info.get('priceToBook', 0.0) or 0.0
+                 total_mv = info.get('marketCap', 0.0) or 0.0
+                 high_52w = info.get('fiftyTwoWeekHigh', 0.0) or 0.0
+                 low_52w = info.get('fiftyTwoWeekLow', 0.0) or 0.0
+             except Exception:
+                 pass
+                 
+             # Fallback to fast_info
+             if total_mv == 0 and hasattr(fast_info, 'market_cap'):
+                  total_mv = fast_info.market_cap or 0.0
+             if high_52w == 0 and hasattr(fast_info, 'year_high'):
+                  high_52w = fast_info.year_high or 0.0
+             if low_52w == 0 and hasattr(fast_info, 'year_low'):
+                  low_52w = fast_info.year_low or 0.0
+             
+             return RealtimeQuote(
+                 code=stock_code,
+                 name=name,
+                 price=price,
+                 change_pct=change_pct,
+                 change_amount=change_amount,
+                 volume_ratio=1.0, 
+                 turnover_rate=0.0,
+                 pe_ratio=pe,
+                 pb_ratio=pb,
+                 total_mv=total_mv,
+                 circ_mv=total_mv,
+                 high_52w=high_52w,
+                 low_52w=low_52w
+             )
+        except Exception as e:
+             logger.warning(f"Yfinance get_realtime_quote failed for {stock_code}: {e}")
+             return None
     
     @retry(
         stop=stop_after_attempt(3),

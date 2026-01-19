@@ -19,7 +19,8 @@ import random
 import time
 from abc import ABC, abstractmethod
 from datetime import datetime
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict, Any
+from dataclasses import dataclass, field
 
 import pandas as pd
 import numpy as np
@@ -51,6 +52,81 @@ class RateLimitError(DataFetchError):
 class DataSourceUnavailableError(DataFetchError):
     """数据源不可用异常"""
     pass
+
+
+@dataclass
+class RealtimeQuote:
+    """
+    实时行情数据
+    
+    包含当日实时交易数据和估值指标
+    """
+    code: str
+    name: str = ""
+    price: float = 0.0           # 最新价
+    change_pct: float = 0.0      # 涨跌幅(%)
+    change_amount: float = 0.0   # 涨跌额
+    
+    # 量价指标
+    volume_ratio: float = 0.0    # 量比（当前成交量/过去5日平均成交量）
+    turnover_rate: float = 0.0   # 换手率(%)
+    amplitude: float = 0.0       # 振幅(%)
+    
+    # 估值指标
+    pe_ratio: float = 0.0        # 市盈率(动态)
+    pb_ratio: float = 0.0        # 市净率
+    total_mv: float = 0.0        # 总市值(元)
+    circ_mv: float = 0.0         # 流通市值(元)
+    
+    # 其他
+    change_60d: float = 0.0      # 60日涨跌幅(%)
+    high_52w: float = 0.0        # 52周最高
+    low_52w: float = 0.0         # 52周最低
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """转换为字典"""
+        return {
+            'code': self.code,
+            'name': self.name,
+            'price': self.price,
+            'change_pct': self.change_pct,
+            'volume_ratio': self.volume_ratio,
+            'turnover_rate': self.turnover_rate,
+            'amplitude': self.amplitude,
+            'pe_ratio': self.pe_ratio,
+            'pb_ratio': self.pb_ratio,
+            'total_mv': self.total_mv,
+            'circ_mv': self.circ_mv,
+            'change_60d': self.change_60d,
+        }
+
+
+@dataclass  
+class ChipDistribution:
+    """
+    筹码分布数据
+    
+    反映持仓成本分布和获利情况
+    """
+    code: str
+    date: str = ""
+    
+    # 获利情况
+    profit_ratio: float = 0.0     # 获利比例(0-1)
+    avg_cost: float = 0.0         # 平均成本
+    
+    # 筹码集中度
+    concentration_90: float = 0.0 # 90%筹码集中度
+    concentration_70: float = 0.0 # 70%筹码集中度
+    
+    # 成本区间
+    cost_min: float = 0.0         # 筹码最低价
+    cost_max: float = 0.0         # 筹码最高价
+    
+    def __str__(self) -> str:
+        return (f"筹码分布(获利:{self.profit_ratio:.1%}, "
+                f"成本:{self.avg_cost:.2f}, "
+                f"集中度:{self.concentration_90:.1%})")
 
 
 class BaseFetcher(ABC):
@@ -322,8 +398,35 @@ class DataFetcherManager:
         """
         errors = []
         
-        for fetcher in self._fetchers:
+        # 针对美股代码（纯字母）的特殊处理
+        # 策略：如果代码是纯字母（且不带.SS/.SZ等后缀），优先使用 YfinanceFetcher
+        is_us_stock_code = (
+            stock_code.replace('.', '').isalpha() and 
+            not stock_code.endswith(('.SS', '.SZ', '.SH')) and
+            len(stock_code) <= 5  # 美股代码通常较短
+        )
+        
+        # 构建本次使用的 fetcher 列表
+        current_fetchers = list(self._fetchers)
+        
+        if is_us_stock_code:
+            # 找到 YfinanceFetcher 并将其排到第一位
+            yf_fetcher = next((f for f in current_fetchers if f.name == 'YfinanceFetcher'), None)
+            if yf_fetcher:
+                # 将 YfinanceFetcher 移到首位
+                current_fetchers.remove(yf_fetcher)
+                current_fetchers.insert(0, yf_fetcher)
+                logger.info(f"检测到美股代码 {stock_code}，优先使用 YfinanceFetcher")
+        
+        for fetcher in current_fetchers:
             try:
+                # 对于美股代码，跳过明确不支持的国内源（Akshare/Efinance/Baostock 通常需要数字代码）
+                if is_us_stock_code and fetcher.name != 'YfinanceFetcher':
+                    # 也可以尝试，但为了效率可以选择跳过
+                    # 目前 Akshare/Efinance 遇到字母代码可能会报错或乱码，安全起见可以尝试，但 Yfinance 已经在第一位了
+                    # 如果 Yfinance 失败了，后续的国内源大概率也不行，但作为兜底可以保留，或者在这里根据 fetcher 特性过滤
+                    pass
+
                 logger.info(f"尝试使用 [{fetcher.name}] 获取 {stock_code}...")
                 df = fetcher.get_daily_data(
                     stock_code=stock_code,
